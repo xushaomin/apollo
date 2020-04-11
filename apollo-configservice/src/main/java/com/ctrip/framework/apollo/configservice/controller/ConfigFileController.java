@@ -4,6 +4,7 @@ import com.ctrip.framework.apollo.biz.entity.ReleaseMessage;
 import com.ctrip.framework.apollo.biz.grayReleaseRule.GrayReleaseRulesHolder;
 import com.ctrip.framework.apollo.biz.message.ReleaseMessageListener;
 import com.ctrip.framework.apollo.biz.message.Topics;
+import com.ctrip.framework.apollo.configservice.service.AppNamespaceServiceWithCache;
 import com.ctrip.framework.apollo.configservice.util.NamespaceUtil;
 import com.ctrip.framework.apollo.configservice.util.WatchKeysUtil;
 import com.ctrip.framework.apollo.core.ConfigConsts;
@@ -15,8 +16,6 @@ import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
-import com.google.common.cache.RemovalListener;
-import com.google.common.cache.RemovalNotification;
 import com.google.common.cache.Weigher;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Lists;
@@ -49,247 +48,276 @@ import java.util.concurrent.TimeUnit;
 @RestController
 @RequestMapping("/configfiles")
 public class ConfigFileController implements ReleaseMessageListener {
-  private static final Logger logger = LoggerFactory.getLogger(ConfigFileController.class);
-  private static final Joiner STRING_JOINER = Joiner.on(ConfigConsts.CLUSTER_NAMESPACE_SEPARATOR);
-  private static final Splitter X_FORWARDED_FOR_SPLITTER = Splitter.on(",").omitEmptyStrings()
-      .trimResults();
-  private static final long MAX_CACHE_SIZE = 50 * 1024 * 1024; // 50MB
-  private static final long EXPIRE_AFTER_WRITE = 30;
-  private final HttpHeaders propertiesResponseHeaders;
-  private final HttpHeaders jsonResponseHeaders;
-  private final ResponseEntity<String> NOT_FOUND_RESPONSE;
-  private Cache<String, String> localCache;
-  private final Multimap<String, String>
-      watchedKeys2CacheKey = Multimaps.synchronizedSetMultimap(HashMultimap.create());
-  private final Multimap<String, String>
-      cacheKey2WatchedKeys = Multimaps.synchronizedSetMultimap(HashMultimap.create());
-  private static final Gson gson = new Gson();
+	
+	private static final Logger logger = LoggerFactory.getLogger(ConfigFileController.class);
+	
+	private static final Joiner STRING_JOINER = Joiner.on(ConfigConsts.CLUSTER_NAMESPACE_SEPARATOR);
+	private static final Splitter X_FORWARDED_FOR_SPLITTER = Splitter.on(",").omitEmptyStrings().trimResults();
+	private static final long MAX_CACHE_SIZE = 50 * 1024 * 1024; // 50MB
+	private static final long EXPIRE_AFTER_WRITE = 30;
+	private final HttpHeaders propertiesResponseHeaders;
+	private final HttpHeaders jsonResponseHeaders;
+	private final ResponseEntity<String> NOT_FOUND_RESPONSE;
+	private Cache<String, String> localCache;
+	private final Multimap<String, String> watchedKeys2CacheKey = Multimaps.synchronizedSetMultimap(HashMultimap.create());
+	private final Multimap<String, String> cacheKey2WatchedKeys = Multimaps.synchronizedSetMultimap(HashMultimap.create());
+	private static final Gson gson = new Gson();
 
-  private final ConfigController configController;
-  private final NamespaceUtil namespaceUtil;
-  private final WatchKeysUtil watchKeysUtil;
-  private final GrayReleaseRulesHolder grayReleaseRulesHolder;
+	private final ConfigController configController;
+	private final NamespaceUtil namespaceUtil;
+	private final WatchKeysUtil watchKeysUtil;
+	private final GrayReleaseRulesHolder grayReleaseRulesHolder;
+	private final AppNamespaceServiceWithCache appNamespaceService;
 
-  public ConfigFileController(
-      final ConfigController configController,
-      final NamespaceUtil namespaceUtil,
-      final WatchKeysUtil watchKeysUtil,
-      final GrayReleaseRulesHolder grayReleaseRulesHolder) {
-    localCache = CacheBuilder.newBuilder()
-        .expireAfterWrite(EXPIRE_AFTER_WRITE, TimeUnit.MINUTES)
-        .weigher((Weigher<String, String>) (key, value) -> value == null ? 0 : value.length())
-        .maximumWeight(MAX_CACHE_SIZE)
-        .removalListener(notification -> {
-          String cacheKey = notification.getKey();
-          logger.debug("removing cache key: {}", cacheKey);
-          if (!cacheKey2WatchedKeys.containsKey(cacheKey)) {
-            return;
-          }
-          //create a new list to avoid ConcurrentModificationException
-          List<String> watchedKeys = new ArrayList<>(cacheKey2WatchedKeys.get(cacheKey));
-          for (String watchedKey : watchedKeys) {
-            watchedKeys2CacheKey.remove(watchedKey, cacheKey);
-          }
-          cacheKey2WatchedKeys.removeAll(cacheKey);
-          logger.debug("removed cache key: {}", cacheKey);
-        })
-        .build();
-    propertiesResponseHeaders = new HttpHeaders();
-    propertiesResponseHeaders.add("Content-Type", "text/plain;charset=UTF-8");
-    jsonResponseHeaders = new HttpHeaders();
-    jsonResponseHeaders.add("Content-Type", "application/json;charset=UTF-8");
-    NOT_FOUND_RESPONSE = new ResponseEntity<>(HttpStatus.NOT_FOUND);
-    this.configController = configController;
-    this.namespaceUtil = namespaceUtil;
-    this.watchKeysUtil = watchKeysUtil;
-    this.grayReleaseRulesHolder = grayReleaseRulesHolder;
-  }
+	public ConfigFileController(
+			final ConfigController configController, 
+			final NamespaceUtil namespaceUtil,
+			final WatchKeysUtil watchKeysUtil, 
+			final GrayReleaseRulesHolder grayReleaseRulesHolder,
+			final AppNamespaceServiceWithCache appNamespaceService) {
+		localCache = CacheBuilder.newBuilder()
+				.expireAfterWrite(EXPIRE_AFTER_WRITE, TimeUnit.MINUTES)
+				.weigher((Weigher<String, String>) (key, value) -> value == null ? 0 : value.length())
+				.maximumWeight(MAX_CACHE_SIZE).removalListener(notification -> {
+					String cacheKey = notification.getKey();
+					logger.debug("removing cache key: {}", cacheKey);
+					if (!cacheKey2WatchedKeys.containsKey(cacheKey)) {
+						return;
+					}
+					// create a new list to avoid ConcurrentModificationException
+					List<String> watchedKeys = new ArrayList<>(cacheKey2WatchedKeys.get(cacheKey));
+					for (String watchedKey : watchedKeys) {
+						watchedKeys2CacheKey.remove(watchedKey, cacheKey);
+					}
+					cacheKey2WatchedKeys.removeAll(cacheKey);
+					logger.debug("removed cache key: {}", cacheKey);
+				}).build();
+		propertiesResponseHeaders = new HttpHeaders();
+		propertiesResponseHeaders.add("Content-Type", "text/plain;charset=UTF-8");
+		jsonResponseHeaders = new HttpHeaders();
+		jsonResponseHeaders.add("Content-Type", "application/json;charset=UTF-8");
+		NOT_FOUND_RESPONSE = new ResponseEntity<>(HttpStatus.NOT_FOUND);
+		this.configController = configController;
+		this.namespaceUtil = namespaceUtil;
+		this.watchKeysUtil = watchKeysUtil;
+		this.grayReleaseRulesHolder = grayReleaseRulesHolder;
+		this.appNamespaceService = appNamespaceService;
+	}
 
-  @GetMapping(value = "/{appId}/{clusterName}/{namespace:.+}")
-  public ResponseEntity<String> queryConfigAsProperties(@PathVariable String appId,
-                                                        @PathVariable String clusterName,
-                                                        @PathVariable String namespace,
-                                                        @RequestParam(value = "dataCenter", required = false) String dataCenter,
-                                                        @RequestParam(value = "ip", required = false) String clientIp,
-                                                        HttpServletRequest request,
-                                                        HttpServletResponse response)
-      throws IOException {
+	@GetMapping(value = "/{appId}/{clusterName}/{namespace:.+}")
+	public ResponseEntity<String> queryConfigAsProperties(
+			@PathVariable String appId, 
+			@PathVariable String clusterName,
+			@PathVariable String namespace, 
+			@RequestParam(value = "dataCenter", required = false) String dataCenter,
+			@RequestParam(value = "ip", required = false) String clientIp, 
+			HttpServletRequest request, HttpServletResponse response) throws IOException {
+		String result = queryConfig(ConfigFileOutputFormat.PROPERTIES, appId, clusterName, namespace, dataCenter, clientIp, request, response);
+		if (result == null) {
+			return NOT_FOUND_RESPONSE;
+		}
+		return new ResponseEntity<>(result, propertiesResponseHeaders, HttpStatus.OK);
+	}
 
-    String result =
-        queryConfig(ConfigFileOutputFormat.PROPERTIES, appId, clusterName, namespace, dataCenter,
-            clientIp, request, response);
+	@GetMapping(value = "/json/{appId}/{clusterName}/{namespace:.+}")
+	public ResponseEntity<String> queryConfigAsJson(
+			@PathVariable String appId, 
+			@PathVariable String clusterName,
+			@PathVariable String namespace, 
+			@RequestParam(value = "dataCenter", required = false) String dataCenter,
+			@RequestParam(value = "ip", required = false) String clientIp, 
+			HttpServletRequest request, HttpServletResponse response) throws IOException {
+		String result = queryConfig(ConfigFileOutputFormat.JSON, appId, clusterName, namespace, dataCenter, clientIp, request, response);
+		if (result == null) {
+			return NOT_FOUND_RESPONSE;
+		}
 
-    if (result == null) {
-      return NOT_FOUND_RESPONSE;
-    }
+		return new ResponseEntity<>(result, jsonResponseHeaders, HttpStatus.OK);
+	}
 
-    return new ResponseEntity<>(result, propertiesResponseHeaders, HttpStatus.OK);
-  }
+	String queryConfig(ConfigFileOutputFormat outputFormat, 
+			String appId, String clusterName, String namespace,
+			String dataCenter, String clientIp, 
+			HttpServletRequest request, HttpServletResponse response) throws IOException {
+		// strip out .properties suffix
+		namespace = namespaceUtil.filterNamespaceName(namespace);
+		// fix the character case issue, such as FX.apollo <-> fx.apollo
+		namespace = namespaceUtil.normalizeNamespace(appId, namespace);
 
-  @GetMapping(value = "/json/{appId}/{clusterName}/{namespace:.+}")
-  public ResponseEntity<String> queryConfigAsJson(@PathVariable String appId,
-                                                  @PathVariable String clusterName,
-                                                  @PathVariable String namespace,
-                                                  @RequestParam(value = "dataCenter", required = false) String dataCenter,
-                                                  @RequestParam(value = "ip", required = false) String clientIp,
-                                                  HttpServletRequest request,
-                                                  HttpServletResponse response) throws IOException {
+		if (Strings.isNullOrEmpty(clientIp)) {
+			clientIp = tryToGetClientIp(request);
+		}
 
-    String result =
-        queryConfig(ConfigFileOutputFormat.JSON, appId, clusterName, namespace, dataCenter,
-            clientIp, request, response);
+		// 1. check whether this client has gray release rules
+		boolean hasGrayReleaseRule = grayReleaseRulesHolder.hasGrayReleaseRule(appId, clientIp, namespace);
 
-    if (result == null) {
-      return NOT_FOUND_RESPONSE;
-    }
+		String cacheKey = assembleCacheKey(outputFormat, appId, clusterName, namespace, dataCenter);
 
-    return new ResponseEntity<>(result, jsonResponseHeaders, HttpStatus.OK);
-  }
+		// 2. try to load gray release and return
+		if (hasGrayReleaseRule) {
+			Tracer.logEvent("ConfigFile.Cache.GrayRelease", cacheKey);
+			return loadConfig(outputFormat, appId, clusterName, namespace, dataCenter, clientIp, request, response);
+		}
 
-  String queryConfig(ConfigFileOutputFormat outputFormat, String appId, String clusterName,
-                     String namespace, String dataCenter, String clientIp,
-                     HttpServletRequest request,
-                     HttpServletResponse response) throws IOException {
-    //strip out .properties suffix
-    namespace = namespaceUtil.filterNamespaceName(namespace);
-    //fix the character case issue, such as FX.apollo <-> fx.apollo
-    namespace = namespaceUtil.normalizeNamespace(appId, namespace);
+		// 3. if not gray release, check weather cache exists, if exists, return
+		String result = localCache.getIfPresent(cacheKey);
 
-    if (Strings.isNullOrEmpty(clientIp)) {
-      clientIp = tryToGetClientIp(request);
-    }
+		// 4. if not exists, load from ConfigController
+		if (Strings.isNullOrEmpty(result)) {
+			Tracer.logEvent("ConfigFile.Cache.Miss", cacheKey);
+			result = loadConfig(outputFormat, appId, clusterName, namespace, dataCenter, clientIp, request, response);
 
-    //1. check whether this client has gray release rules
-    boolean hasGrayReleaseRule = grayReleaseRulesHolder.hasGrayReleaseRule(appId, clientIp,
-        namespace);
+			if (result == null) {
+				return null;
+			}
+			// 5. Double check if this client needs to load gray release, if yes, load from
+			// db again
+			// This step is mainly to avoid cache pollution
+			if (grayReleaseRulesHolder.hasGrayReleaseRule(appId, clientIp, namespace)) {
+				Tracer.logEvent("ConfigFile.Cache.GrayReleaseConflict", cacheKey);
+				return loadConfig(outputFormat, appId, clusterName, namespace, dataCenter, clientIp, request, response);
+			}
 
-    String cacheKey = assembleCacheKey(outputFormat, appId, clusterName, namespace, dataCenter);
+			localCache.put(cacheKey, result);
+			logger.debug("adding cache for key: {}", cacheKey);
 
-    //2. try to load gray release and return
-    if (hasGrayReleaseRule) {
-      Tracer.logEvent("ConfigFile.Cache.GrayRelease", cacheKey);
-      return loadConfig(outputFormat, appId, clusterName, namespace, dataCenter, clientIp,
-          request, response);
-    }
+			Set<String> watchedKeys = watchKeysUtil.assembleAllWatchKeys(appId, clusterName, namespace, dataCenter);
 
-    //3. if not gray release, check weather cache exists, if exists, return
-    String result = localCache.getIfPresent(cacheKey);
+			for (String watchedKey : watchedKeys) {
+				watchedKeys2CacheKey.put(watchedKey, cacheKey);
+			}
 
-    //4. if not exists, load from ConfigController
-    if (Strings.isNullOrEmpty(result)) {
-      Tracer.logEvent("ConfigFile.Cache.Miss", cacheKey);
-      result = loadConfig(outputFormat, appId, clusterName, namespace, dataCenter, clientIp,
-          request, response);
+			cacheKey2WatchedKeys.putAll(cacheKey, watchedKeys);
+			logger.debug("added cache for key: {}", cacheKey);
+		} else {
+			Tracer.logEvent("ConfigFile.Cache.Hit", cacheKey);
+		}
 
-      if (result == null) {
-        return null;
-      }
-      //5. Double check if this client needs to load gray release, if yes, load from db again
-      //This step is mainly to avoid cache pollution
-      if (grayReleaseRulesHolder.hasGrayReleaseRule(appId, clientIp, namespace)) {
-        Tracer.logEvent("ConfigFile.Cache.GrayReleaseConflict", cacheKey);
-        return loadConfig(outputFormat, appId, clusterName, namespace, dataCenter, clientIp,
-            request, response);
-      }
+		return result;
+	}
 
-      localCache.put(cacheKey, result);
-      logger.debug("adding cache for key: {}", cacheKey);
+	private String loadConfig(ConfigFileOutputFormat outputFormat, 
+			String appId, String clusterName, String namespace,
+			String dataCenter, String clientIp, 
+			HttpServletRequest request, HttpServletResponse response) throws IOException {
+		ApolloConfig apolloConfig = configController.queryConfig(appId, clusterName, namespace, dataCenter, "-1",
+				clientIp, null, request, response);
 
-      Set<String> watchedKeys =
-          watchKeysUtil.assembleAllWatchKeys(appId, clusterName, namespace, dataCenter);
+		if (apolloConfig == null || apolloConfig.getConfigurations() == null) {
+			return null;
+		}
 
-      for (String watchedKey : watchedKeys) {
-        watchedKeys2CacheKey.put(watchedKey, cacheKey);
-      }
+		String result = null;
 
-      cacheKey2WatchedKeys.putAll(cacheKey, watchedKeys);
-      logger.debug("added cache for key: {}", cacheKey);
-    } else {
-      Tracer.logEvent("ConfigFile.Cache.Hit", cacheKey);
-    }
+		switch (outputFormat) {
+			case PROPERTIES:
+				Properties properties = new Properties();
+				properties.putAll(apolloConfig.getConfigurations());
+				result = PropertiesUtil.toString(properties);
+				break;
+			case JSON:
+				result = gson.toJson(apolloConfig.getConfigurations());
+				break;
+		}
 
-    return result;
-  }
+		return result;
+	}
 
-  private String loadConfig(ConfigFileOutputFormat outputFormat, String appId, String clusterName,
-                            String namespace, String dataCenter, String clientIp,
-                            HttpServletRequest request,
-                            HttpServletResponse response) throws IOException {
-    ApolloConfig apolloConfig = configController.queryConfig(appId, clusterName, namespace,
-        dataCenter, "-1", clientIp, null, request, response);
+	String assembleCacheKey(ConfigFileOutputFormat outputFormat, String appId, String clusterName, String namespace, String dataCenter) {
+		List<String> keyParts = Lists.newArrayList(outputFormat.getValue(), appId, clusterName, namespace);
+		if (!Strings.isNullOrEmpty(dataCenter)) {
+			keyParts.add(dataCenter);
+		}
+		return STRING_JOINER.join(keyParts);
+	}
 
-    if (apolloConfig == null || apolloConfig.getConfigurations() == null) {
-      return null;
-    }
+	@Override
+	public void handleMessage(ReleaseMessage message, String channel) {
+		logger.info("message received - channel: {}, message: {}", channel, message);
 
-    String result = null;
+		String content = message.getMessage();
+		if (!Topics.APOLLO_RELEASE_TOPIC.equals(channel) || Strings.isNullOrEmpty(content)) {
+			return;
+		}
 
-    switch (outputFormat) {
-      case PROPERTIES:
-        Properties properties = new Properties();
-        properties.putAll(apolloConfig.getConfigurations());
-        result = PropertiesUtil.toString(properties);
-        break;
-      case JSON:
-        result = gson.toJson(apolloConfig.getConfigurations());
-        break;
-    }
+		if (!watchedKeys2CacheKey.containsKey(content)) {
+			return;
+		}
 
-    return result;
-  }
+		// create a new list to avoid ConcurrentModificationException
+		List<String> cacheKeys = new ArrayList<>(watchedKeys2CacheKey.get(content));
 
-  String assembleCacheKey(ConfigFileOutputFormat outputFormat, String appId, String clusterName,
-                          String namespace,
-                          String dataCenter) {
-    List<String> keyParts =
-        Lists.newArrayList(outputFormat.getValue(), appId, clusterName, namespace);
-    if (!Strings.isNullOrEmpty(dataCenter)) {
-      keyParts.add(dataCenter);
-    }
-    return STRING_JOINER.join(keyParts);
-  }
+		for (String cacheKey : cacheKeys) {
+			logger.debug("invalidate cache key: {}", cacheKey);
+			localCache.invalidate(cacheKey);
+		}
+	}
 
-  @Override
-  public void handleMessage(ReleaseMessage message, String channel) {
-    logger.info("message received - channel: {}, message: {}", channel, message);
+	enum ConfigFileOutputFormat {
+		PROPERTIES("properties"), 
+		JSON("json");
 
-    String content = message.getMessage();
-    if (!Topics.APOLLO_RELEASE_TOPIC.equals(channel) || Strings.isNullOrEmpty(content)) {
-      return;
-    }
+		private String value;
 
-    if (!watchedKeys2CacheKey.containsKey(content)) {
-      return;
-    }
+		ConfigFileOutputFormat(String value) {
+			this.value = value;
+		}
 
-    //create a new list to avoid ConcurrentModificationException
-    List<String> cacheKeys = new ArrayList<>(watchedKeys2CacheKey.get(content));
+		public String getValue() {
+			return value;
+		}
+	}
 
-    for (String cacheKey : cacheKeys) {
-      logger.debug("invalidate cache key: {}", cacheKey);
-      localCache.invalidate(cacheKey);
-    }
-  }
+	private String tryToGetClientIp(HttpServletRequest request) {
+		String forwardedFor = request.getHeader("X-FORWARDED-FOR");
+		if (!Strings.isNullOrEmpty(forwardedFor)) {
+			return X_FORWARDED_FOR_SPLITTER.splitToList(forwardedFor).get(0);
+		}
+		return request.getRemoteAddr();
+	}
+	
+	
+	public String replaceLast(String text, String strToReplace, String replaceWithThis) {
+		return text.replaceFirst("(?s)" + strToReplace + "(?!.*?" + strToReplace + ")", replaceWithThis);
+	}
 
-  enum ConfigFileOutputFormat {
-    PROPERTIES("properties"), JSON("json");
+	//add by cruise.xu
+	@GetMapping(value = "/{appId}/{clusterName}")
+	public ResponseEntity<String> queryConfigsAsProperties(
+			@PathVariable String appId, 
+			@PathVariable String clusterName,
+			@RequestParam(value = "dataCenter", required = false) String dataCenter,
+			@RequestParam(value = "ip", required = false) String clientIp, 
+			HttpServletRequest request, HttpServletResponse response) throws IOException {
+		Set<String> namespaces = appNamespaceService.findNamespacesByAppId(appId);
+		if (namespaces.size() == 0) {
+			return NOT_FOUND_RESPONSE;
+		}
+		String results = "";
+		for (String namespace : namespaces) {
+			String result = queryConfig(ConfigFileOutputFormat.PROPERTIES, appId, clusterName, namespace, dataCenter, clientIp, request, response);
+			results = results + result;
+		}
+		return new ResponseEntity<>(results, propertiesResponseHeaders, HttpStatus.OK);
+	}
 
-    private String value;
-
-    ConfigFileOutputFormat(String value) {
-      this.value = value;
-    }
-
-    public String getValue() {
-      return value;
-    }
-  }
-
-  private String tryToGetClientIp(HttpServletRequest request) {
-    String forwardedFor = request.getHeader("X-FORWARDED-FOR");
-    if (!Strings.isNullOrEmpty(forwardedFor)) {
-      return X_FORWARDED_FOR_SPLITTER.splitToList(forwardedFor).get(0);
-    }
-    return request.getRemoteAddr();
-  }
+	@GetMapping(value = "/json/{appId}/{clusterName}")
+	public ResponseEntity<String> queryConfigsAsJson(
+			@PathVariable String appId, 
+			@PathVariable String clusterName,
+			@RequestParam(value = "dataCenter", required = false) String dataCenter,
+			@RequestParam(value = "ip", required = false) String clientIp, 
+			HttpServletRequest request, HttpServletResponse response) throws IOException {
+		Set<String> namespaces = appNamespaceService.findNamespacesByAppId(appId);
+		if (namespaces.size() == 0) {
+			return NOT_FOUND_RESPONSE;
+		}
+		String results = "[";
+		for (String namespace : namespaces) {
+			String result = queryConfig(ConfigFileOutputFormat.JSON, appId, clusterName, namespace, dataCenter, clientIp, request, response);
+			results = results + result + ",";
+		}
+		results = results.substring(0, results.length() - 1) + "]";
+		return new ResponseEntity<>(results, jsonResponseHeaders, HttpStatus.OK);
+	}
 }
