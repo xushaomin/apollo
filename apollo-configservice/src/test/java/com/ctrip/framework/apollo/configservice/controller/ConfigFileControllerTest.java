@@ -3,6 +3,7 @@ package com.ctrip.framework.apollo.configservice.controller;
 import com.ctrip.framework.apollo.biz.entity.ReleaseMessage;
 import com.ctrip.framework.apollo.biz.grayReleaseRule.GrayReleaseRulesHolder;
 import com.ctrip.framework.apollo.biz.message.Topics;
+import com.ctrip.framework.apollo.configservice.service.AppNamespaceServiceWithCache;
 import com.ctrip.framework.apollo.configservice.util.NamespaceUtil;
 import com.ctrip.framework.apollo.configservice.util.WatchKeysUtil;
 import com.ctrip.framework.apollo.core.dto.ApolloConfig;
@@ -58,11 +59,12 @@ public class ConfigFileControllerTest {
   private HttpServletRequest someRequest;
   Multimap<String, String> watchedKeys2CacheKey;
   Multimap<String, String> cacheKey2WatchedKeys;
+  private AppNamespaceServiceWithCache appNamespaceService;
 
   @Before
   public void setUp() throws Exception {
     configFileController = new ConfigFileController(
-        configController, namespaceUtil, watchKeysUtil, grayReleaseRulesHolder
+        configController, namespaceUtil, watchKeysUtil, grayReleaseRulesHolder, appNamespaceService
     );
 
     someAppId = "someAppId";
